@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Service
+MimeType=all/allfiles;inode/directory;
+Actions=openSnapshots;
+X-KDE-Priority=TopLevel
+
+[Desktop Action openSnapshots]
+Name=Ver versões nos Snapshots...
+Icon=document-revert
+Exec=bash -c '$HOME/.local/bin/snapper-view "$1"' _ "%f"

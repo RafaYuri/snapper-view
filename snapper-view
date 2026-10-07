@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+TARGET=$(realpath "$1")
+BASE="/var/home"
+
+# Valida se o alvo está no subvolume monitorado
+if [[ "$TARGET" != "$BASE"* ]]; then
+    kdialog --title "Snapshots" --error "O item selecionado não pertence a $BASE."
+    exit 1
+fi
+
+# Extrai o caminho relativo dentro do subvolume
+REL_PATH="${TARGET#$BASE/}"
+
+# Coleta os snapshots que contêm o item (do mais recente para o mais antigo)
+ITEMS=()
+for snap_dir in $(ls -vdr /var/home/.snapshots/*/ 2>/dev/null); do
+    snap_id=$(basename "$snap_dir")
+    [[ "$snap_id" =~ ^[0-9]+$ ]] || continue
+
+    snap_target="$snap_dir/snapshot/$REL_PATH"
+    info_file="$snap_dir/info.xml"
+
+    if [ -e "$snap_target" ]; then
+        # Obtém a data local real da criação do snapshot
+        if [ -f "$info_file" ]; then
+            snap_date=$(stat -c '%y' "$info_file" 2>/dev/null | cut -d'.' -f1)
+            snap_desc=$(sed -n 's/.*<description>\(.*\)<\/description>.*/\1/p' "$info_file" 2>/dev/null)
+        else
+            snap_date=$(stat -c '%y' "$snap_dir" 2>/dev/null | cut -d'.' -f1)
+            snap_desc=""
+        fi
+
+        # Monta o rótulo com ID, descrição (se houver) e timestamp
+        desc_text="${snap_desc:+ - $snap_desc}"
+        ITEMS+=("$snap_id" "Snapshot #$snap_id$desc_text ($snap_date)")
+    fi
+done
+
+if [ ${#ITEMS[@]} -eq 0 ]; then
+    kdialog --title "Snapshots" --sorry "Nenhum snapshot encontrado contendo este item."
+    exit 0
+fi
+
+# Exibe o menu nativo de seleção
+CHOSEN_ID=$(kdialog --title "Versões de: $(basename "$TARGET")" \
+                    --menu "Selecione o snapshot que deseja abrir:" \
+                    "${ITEMS[@]}")
+
+# Abre o Dolphin no snapshot escolhido
+if [ -n "$CHOSEN_ID" ]; then
+    DEST="$BASE/.snapshots/$CHOSEN_ID/snapshot/$REL_PATH"
+    if [ -d "$DEST" ]; then
+        dolphin "$DEST" &
+    else
+        dolphin --select "$DEST" &
+    fi
+fi
