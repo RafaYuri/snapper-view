@@ -1,57 +1,587 @@
 #!/usr/bin/env bash
-TARGET=$(realpath "$1")
-BASE="/var/home"
+#
+# snapper-view - Visualizador, comparador e restaurador de snapshots Btrfs/Snapper para KDE Dolphin
+#
 
-# Valida se o alvo está no subvolume monitorado
-if [[ "$TARGET" != "$BASE"* ]]; then
-    kdialog --title "Snapshots" --error "O item selecionado não pertence a $BASE."
+set -uo pipefail
+
+if [[ $# -lt 1 || -z "${1:-}" ]]; then
+    kdialog --title "Snapshots (snapper-view)" --error "Nenhum arquivo ou diretório foi informado."
     exit 1
 fi
 
-# Extrai o caminho relativo dentro do subvolume
-REL_PATH="${TARGET#$BASE/}"
+RAW_TARGET="$1"
+TARGET=$(realpath "$RAW_TARGET" 2>/dev/null || echo "$RAW_TARGET")
 
-# Coleta os snapshots que contêm o item (do mais recente para o mais antigo)
-ITEMS=()
-for snap_dir in $(ls -vdr /var/home/.snapshots/*/ 2>/dev/null); do
+# Formata tempo relativo de forma amigável a partir do epoch em segundos
+format_relative_time() {
+    local snap_epoch="$1"
+    local now_epoch
+    now_epoch=$(date "+%s")
+    local diff=$(( now_epoch - snap_epoch ))
+
+    if (( diff < 0 )); then
+        echo "agora"
+    elif (( diff < 60 )); then
+        echo "agora mesmo"
+    elif (( diff < 3600 )); then
+        echo "há $(( diff / 60 )) min"
+    elif (( diff < 86400 )); then
+        echo "há $(( diff / 3600 )) h"
+    elif (( diff < 172800 )); then
+        echo "ontem"
+    elif (( diff < 2592000 )); then
+        echo "há $(( diff / 86400 )) dias"
+    elif (( diff < 31536000 )); then
+        echo "há $(( diff / 2592000 )) meses"
+    else
+        echo "há $(( diff / 31536000 )) anos"
+    fi
+}
+
+# Formata tamanho em bytes para leitura humana
+format_size() {
+    local bytes="$1"
+    if command -v numfmt &>/dev/null; then
+        numfmt --to=iec-i --suffix=B "$bytes" 2>/dev/null || echo "${bytes}B"
+    else
+        echo "${bytes}B"
+    fi
+}
+
+# Detecta automaticamente o subvolume base onde reside a pasta .snapshots
+find_snapper_base() {
+    local path="$1"
+
+    # Caso o usuário tenha clicado em um item que já está dentro de .snapshots
+    if [[ "$path" == *"/.snapshots/"*"/snapshot/"* ]]; then
+        echo "${path%%/.snapshots/*}"
+        return 0
+    fi
+
+    local dir="$path"
+    if [[ ! -d "$dir" ]]; then
+        dir=$(dirname "$dir")
+    fi
+
+    # Sobe na árvore de diretórios procurando por .snapshots
+    while [[ "$dir" != "/" && -n "$dir" ]]; do
+        if [[ -e "$dir/.snapshots" ]]; then
+            echo "$dir"
+            return 0
+        fi
+        dir=$(dirname "$dir")
+    done
+
+    # Verifica na raiz /
+    if [[ -e "/.snapshots" ]]; then
+        echo "/"
+        return 0
+    fi
+
+    # Fallback: consulta snapper list-configs se disponível
+    if command -v snapper &>/dev/null; then
+        local cfg_subv
+        while IFS=, read -r cfg subv; do
+            [[ "$cfg" == "config" || -z "$subv" ]] && continue
+            if [[ "$path" == "$subv"* ]]; then
+                echo "$subv"
+                return 0
+            fi
+        done < <(snapper --csv list-configs 2>/dev/null)
+    fi
+
+    return 1
+}
+
+# Verifica se há permissão de leitura e travessia em .snapshots
+ensure_snapshots_permission() {
+    local base_dir="$1"
+    local snaps_dir="$base_dir/.snapshots"
+
+    if [[ -r "$snaps_dir" && -x "$snaps_dir" ]]; then
+        return 0
+    fi
+
+    local current_user="${USER:-$(id -un)}"
+    if kdialog --title "Permissão Necessária - Snapper" \
+               --warningyesno "O usuário '<b>$current_user</b>' não possui permissão para acessar os snapshots em:<br><tt>$snaps_dir</tt><br><br>Deseja configurar as permissões de acesso (ALLOW_USERS e SYNC_ACL) automaticamente agora?"; then
+
+        # Descobre o nome da configuração correspondente ao subvolume
+        local cfg_name=""
+        if command -v snapper &>/dev/null; then
+            cfg_name=$(snapper --csv list-configs 2>/dev/null | awk -F',' -v b="$base_dir" '$2==b {print $1; exit}')
+        fi
+
+        if [[ -z "$cfg_name" ]] && command -v pkexec &>/dev/null; then
+            cfg_name=$(pkexec bash -c "snapper --csv list-configs 2>/dev/null | awk -F',' -v b='$base_dir' '\$2==b {print \$1; exit}'" 2>/dev/null || true)
+        fi
+
+        if [[ -n "$cfg_name" ]] && command -v pkexec &>/dev/null; then
+            if pkexec snapper -c "$cfg_name" set-config "ALLOW_USERS=$current_user" "SYNC_ACL=yes"; then
+                if [[ -r "$snaps_dir" && -x "$snaps_dir" ]]; then
+                    kdialog --title "Snapshots" --msgbox "Permissões configuradas com sucesso para a configuração '$cfg_name'!"
+                    return 0
+                fi
+            fi
+        fi
+
+        kdialog --title "Snapshots" --error "Não foi possível aplicar as permissões automaticamente.\nExecute o script './setup-permissions.sh' no terminal."
+    fi
+    return 1
+}
+
+# Localiza ou instala ferramenta visual de Diff (priorizando Kompare do KDE via pacote nativo ou Flathub)
+run_diff_tool() {
+    local snap_item="$1"
+    local live_item="$2"
+    local base_dir="$3"
+    local snap_id="$4"
+
+    # 1. Verifica binários nativos instalados (priorizando ferramentas KDE)
+    for native_cmd in kompare kdiff3 meld; do
+        if command -v "$native_cmd" &>/dev/null; then
+            "$native_cmd" "$snap_item" "$live_item" &
+            return 0
+        fi
+    done
+
+    # 2. Verifica aplicativos Flatpak instalados (priorizando org.kde.kompare)
+    if command -v flatpak &>/dev/null; then
+        for fp_app in org.kde.kompare org.kde.kdiff3 org.gnome.meld; do
+            if flatpak info "$fp_app" &>/dev/null; then
+                flatpak run \
+                    --filesystem="$base_dir/.snapshots:ro" \
+                    --filesystem="$live_item:ro" \
+                    "$fp_app" "$snap_item" "$live_item" &
+                return 0
+            fi
+        done
+
+        # 3. Oferece instalação automática do Kompare (KDE) via Flathub
+        if kdialog --title "Ferramenta de Comparação (Diff)" \
+                   --yesno "Nenhuma ferramenta gráfica de comparação (Kompare, KDiff3 ou Meld) foi encontrada no sistema.\n\nDeseja instalar o Kompare (ferramenta oficial do KDE) via Flathub agora?\n\n• Clique em 'Sim' para instalar via Flathub e abrir a comparação visual.\n• Clique em 'Não' para visualizar as diferenças em modo texto agora."; then
+
+            kdialog --title "Instalando Kompare" --passivepopup "Baixando e instalando org.kde.kompare via Flathub. Aguarde..." 8 &
+
+            local install_ok=false
+            if flatpak install -y --or-update flathub org.kde.kompare &>/dev/null; then
+                install_ok=true
+            elif flatpak install --user -y --or-update flathub org.kde.kompare &>/dev/null; then
+                install_ok=true
+            fi
+
+            if $install_ok && flatpak info org.kde.kompare &>/dev/null; then
+                kdialog --title "Kompare Instalado" --passivepopup "Kompare instalado com sucesso! Abrindo comparação..." 4 &
+                flatpak run \
+                    --filesystem="$base_dir/.snapshots:ro" \
+                    --filesystem="$live_item:ro" \
+                    org.kde.kompare "$snap_item" "$live_item" &
+                return 0
+            else
+                kdialog --title "Aviso" --sorry "Não foi possível concluir a instalação automática do Kompare via Flathub.\nExibindo comparação em modo texto."
+            fi
+        fi
+    fi
+
+    # 4. Fallback universal: diff unificado exibido no kdialog --textbox
+    local tmp_diff
+    tmp_diff=$(mktemp /tmp/snapper-view-diff.XXXXXX.diff)
+    if diff -ruN "$snap_item" "$live_item" > "$tmp_diff" 2>&1; then
+        kdialog --title "Comparação - Snapshot #$snap_id" \
+                --msgbox "Não há diferenças de conteúdo entre a versão do Snapshot #$snap_id e a versão atual."
+    else
+        kdialog --title "Diferenças: Snapshot #$snap_id vs Atual ($(basename "$live_item"))" \
+                --geometry 820x600 \
+                --textbox "$tmp_diff"
+    fi
+    rm -f "$tmp_diff"
+}
+
+# Restaura o arquivo ou pasta (sobrescrevendo com opção de backup ou criando cópia ao lado)
+restore_snapshot_item() {
+    local snap_item="$1"
+    local live_item="$2"
+    local snap_id="$3"
+    local mode="$4" # "overwrite" ou "copy"
+
+    if [[ "$mode" == "copy" ]]; then
+        local parent_dir base_name copy_name copy_path
+        parent_dir=$(dirname "$live_item")
+        base_name=$(basename "$live_item")
+
+        if [[ -f "$snap_item" && "$base_name" == *.* && "$base_name" != .* ]]; then
+            local name_part="${base_name%.*}"
+            local ext_part="${base_name##*.}"
+            copy_name="${name_part}.snapshot-${snap_id}.${ext_part}"
+        else
+            copy_name="${base_name}.snapshot-${snap_id}"
+        fi
+        copy_path="$parent_dir/$copy_name"
+
+        # Evita colisão caso a cópia já exista
+        local counter=1
+        while [[ -e "$copy_path" ]]; do
+            copy_path="$parent_dir/${copy_name}-${counter}"
+            ((counter++))
+        done
+
+        if cp -aT --reflink=auto "$snap_item" "$copy_path" 2>/dev/null; then
+            if kdialog --title "Restauração Concluída" \
+                       --yesno "Cópia restaurada com sucesso em:\n$copy_path\n\nDeseja mostrar o item restaurado no Dolphin?"; then
+                dolphin --select "$copy_path" &
+            fi
+        else
+            kdialog --title "Erro na Restauração" --error "Falha ao copiar '$snap_item' para '$copy_path'."
+        fi
+        return
+    fi
+
+    # Modo "overwrite": pergunta se deseja criar backup (.bak) antes de substituir
+    local response
+    response=$(kdialog --title "Confirmar Restauração (Snapshot #$snap_id)" \
+                       --yesnocancel "Você está prestes a restaurar:\n$(basename "$live_item")\npara a versão do Snapshot #$snap_id.\n\nDeseja salvar um backup (.bak) da versão atual antes de sobrescrever?" \
+                       --yes-label "Restaurar com Backup (.bak)" \
+                       --no-label "Sobrescrever Diretamente" \
+                       --cancel-label "Cancelar"; echo $?)
+
+    if [[ "$response" -eq 2 ]]; then
+        return 0
+    fi
+
+    if [[ "$response" -eq 0 && -e "$live_item" ]]; then
+        local bak_path="${live_item}.bak-$(date +%Y%m%d-%H%M%S)"
+        if ! mv "$live_item" "$bak_path" 2>/dev/null; then
+            kdialog --title "Erro" --error "Não foi possível criar o backup em:\n$bak_path"
+            return 1
+        fi
+    elif [[ "$response" -eq 1 && -d "$live_item" ]]; then
+        # Remove diretório atual antes de cp -aT para reproduzir fielmente o snapshot
+        rm -rf "$live_item" 2>/dev/null || true
+    fi
+
+    if cp -aT --reflink=auto "$snap_item" "$live_item" 2>/dev/null; then
+        kdialog --title "Restauração Concluída" \
+                --msgbox "O item '$(basename "$live_item")' foi restaurado com sucesso a partir do Snapshot #$snap_id!"
+    else
+        kdialog --title "Erro na Restauração" \
+                --error "Ocorreu um erro ao restaurar '$live_item' a partir do Snapshot #$snap_id."
+    fi
+}
+
+# Procura arquivos/pastas excluídos dentro do diretório selecionado em todos os snapshots
+search_deleted_in_folder() {
+    local base_dir="$1"
+    local rel_path="$2"
+    local live_dir="$3"
+
+    declare -A SEEN_DELETED
+    local DELETED_MENU_ITEMS=()
+
+    local snap_dirs=()
+    while IFS= read -r d; do
+        [[ -n "$d" ]] && snap_dirs+=("$d")
+    done < <(ls -vdr "$base_dir/.snapshots"/*/ 2>/dev/null)
+
+    for snap_dir in "${snap_dirs[@]}"; do
+        local snap_id
+        snap_id=$(basename "$snap_dir")
+        [[ "$snap_id" =~ ^[0-9]+$ ]] || continue
+
+        local snap_folder="$snap_dir/snapshot/$rel_path"
+        [[ -d "$snap_folder" ]] || continue
+
+        local info_file="$snap_dir/info.xml"
+        local snap_date=""
+        if [[ -f "$info_file" ]]; then
+            local xml_date
+            xml_date=$(sed -n 's/.*<date>\(.*\)<\/date>.*/\1/p' "$info_file" 2>/dev/null)
+            if [[ -n "$xml_date" ]]; then
+                snap_date=$(date -d "${xml_date} UTC" "+%Y-%m-%d %H:%M" 2>/dev/null || echo "$xml_date")
+            fi
+        fi
+        [[ -z "$snap_date" ]] && snap_date=$(stat -c '%y' "$snap_dir" 2>/dev/null | cut -d'.' -f1)
+
+        shopt -s nullglob dotglob
+        for item in "$snap_folder"/*; do
+            local item_name
+            item_name=$(basename "$item")
+            [[ "$item_name" == "." || "$item_name" == ".." ]] && continue
+
+            if [[ ! -e "$live_dir/$item_name" && -z "${SEEN_DELETED[$item_name]:-}" ]]; then
+                SEEN_DELETED["$item_name"]="$snap_id"
+                local item_type="Arquivo"
+                local item_meta=""
+                if [[ -d "$item" ]]; then
+                    item_type="Pasta"
+                elif [[ -f "$item" ]]; then
+                    local sz
+                    sz=$(stat -c '%s' "$item" 2>/dev/null || echo 0)
+                    item_meta=" • $(format_size "$sz")"
+                fi
+                DELETED_MENU_ITEMS+=("${snap_id}|${item_name}" "[$item_type] $item_name (visto por último no Snapshot #$snap_id em $snap_date$item_meta)")
+            fi
+        done
+        shopt -u nullglob dotglob
+    done
+
+    if [[ ${#DELETED_MENU_ITEMS[@]} -eq 0 ]]; then
+        kdialog --title "Arquivos Excluídos" \
+                --msgbox "Nenhum arquivo ou pasta excluído foi encontrado nos snapshots anteriores para:\n$live_dir"
+        return 0
+    fi
+
+    local chosen_deleted
+    chosen_deleted=$(kdialog --title "Itens Excluídos em: $(basename "$live_dir")" \
+                             --geometry 760x450 \
+                             --menu "Selecione um item excluído para recuperar ou inspecionar:" \
+                             "${DELETED_MENU_ITEMS[@]}") || return 0
+
+    [[ -z "$chosen_deleted" ]] && return 0
+
+    local del_snap_id="${chosen_deleted%%|*}"
+    local del_name="${chosen_deleted#*|}"
+    local del_source="$base_dir/.snapshots/$del_snap_id/snapshot/$rel_path/$del_name"
+    local del_dest="$live_dir/$del_name"
+
+    local del_action
+    del_action=$(kdialog --title "Recuperar: $del_name (Snapshot #$del_snap_id)" \
+                         --geometry 520x280 \
+                         --menu "O que deseja fazer com '$del_name'?" \
+                         "restore" "♻️ Restaurar para a pasta atual ($live_dir)" \
+                         "dolphin" "📂 Visualizar item no Dolphin (dentro do Snapshot #$del_snap_id)") || return 0
+
+    case "$del_action" in
+        restore)
+            if cp -aT --reflink=auto "$del_source" "$del_dest" 2>/dev/null; then
+                if kdialog --title "Item Recuperado" \
+                           --yesno "'$del_name' foi restaurado com sucesso!\n\nDeseja selecioná-lo no Dolphin?"; then
+                    dolphin --select "$del_dest" &
+                fi
+            else
+                kdialog --title "Erro" --error "Não foi possível restaurar '$del_name'."
+            fi
+            ;;
+        dolphin)
+            if [[ -d "$del_source" ]]; then
+                dolphin "$del_source" &
+            else
+                dolphin --select "$del_source" &
+            fi
+            ;;
+    esac
+}
+
+# 1. Identifica dinamicamente o subvolume base
+if ! BASE=$(find_snapper_base "$TARGET"); then
+    kdialog --title "Snapshots (snapper-view)" \
+            --error "O item selecionado não pertence a um subvolume Btrfs com pasta '.snapshots' ativa:\n$TARGET"
+    exit 1
+fi
+
+# Caso o usuário tenha acionado o menu a partir de um arquivo já dentro de /.snapshots/<ID>/snapshot/
+if [[ "$TARGET" == "$BASE/.snapshots/"*"/snapshot/"* ]]; then
+    REL_PATH="${TARGET#"$BASE"/.snapshots/*/snapshot/}"
+    LIVE_TARGET="$BASE/$REL_PATH"
+elif [[ "$BASE" == "/" ]]; then
+    REL_PATH="${TARGET#/}"
+    LIVE_TARGET="$TARGET"
+else
+    REL_PATH="${TARGET#"$BASE"/}"
+    LIVE_TARGET="$TARGET"
+fi
+
+# 2. Garante permissões de leitura nos snapshots
+if ! ensure_snapshots_permission "$BASE"; then
+    exit 1
+fi
+
+# 3. Obtém metadados do item atual (para indicar se cada snapshot foi modificado ou é idêntico ao atual)
+LIVE_IS_DIR=false
+LIVE_SIG=""
+if [[ -d "$LIVE_TARGET" ]]; then
+    LIVE_IS_DIR=true
+elif [[ -f "$LIVE_TARGET" ]]; then
+    LIVE_MTIME=$(stat -c '%Y' "$LIVE_TARGET" 2>/dev/null || echo "")
+    LIVE_SIZE=$(stat -c '%s' "$LIVE_TARGET" 2>/dev/null || echo "")
+    LIVE_SIG="${LIVE_MTIME}:${LIVE_SIZE}"
+fi
+
+# 4. Coleta snapshots disponíveis (do mais recente para o mais antigo)
+ALL_ITEMS=()
+CHANGED_ITEMS=()
+TOTAL_SNAPS=0
+CHANGED_COUNT=0
+
+# Se for diretório, adiciona atalho direto no topo para buscar arquivos deletados
+if $LIVE_IS_DIR; then
+    ALL_ITEMS+=("__SEARCH_DELETED__" "🗑️ [Procurar arquivos excluídos nesta pasta em todos os snapshots...]")
+fi
+
+SNAP_DIRS=()
+while IFS= read -r d; do
+    [[ -n "$d" ]] && SNAP_DIRS+=("$d")
+done < <(ls -vdr "$BASE/.snapshots"/*/ 2>/dev/null)
+
+for snap_dir in "${SNAP_DIRS[@]}"; do
     snap_id=$(basename "$snap_dir")
     [[ "$snap_id" =~ ^[0-9]+$ ]] || continue
 
     snap_target="$snap_dir/snapshot/$REL_PATH"
     info_file="$snap_dir/info.xml"
 
-    if [ -e "$snap_target" ]; then
-        # Obtém a data local real da criação do snapshot
-        if [ -f "$info_file" ]; then
-            snap_date=$(stat -c '%y' "$info_file" 2>/dev/null | cut -d'.' -f1)
+    if [[ -e "$snap_target" ]]; then
+        ((TOTAL_SNAPS++))
+
+        # Extrai data (convertendo de UTC do info.xml para fuso local) e descrição
+        snap_date=""
+        snap_epoch=""
+        snap_desc=""
+
+        if [[ -f "$info_file" ]]; then
+            xml_date=$(sed -n 's/.*<date>\(.*\)<\/date>.*/\1/p' "$info_file" 2>/dev/null)
             snap_desc=$(sed -n 's/.*<description>\(.*\)<\/description>.*/\1/p' "$info_file" 2>/dev/null)
-        else
-            snap_date=$(stat -c '%y' "$snap_dir" 2>/dev/null | cut -d'.' -f1)
-            snap_desc=""
+            if [[ -n "$xml_date" ]]; then
+                snap_date=$(date -d "${xml_date} UTC" "+%Y-%m-%d %H:%M:%S" 2>/dev/null || true)
+                snap_epoch=$(date -d "${xml_date} UTC" "+%s" 2>/dev/null || true)
+            fi
         fi
 
-        # Monta o rótulo com ID, descrição (se houver) e timestamp
+        if [[ -z "$snap_date" ]]; then
+            snap_date=$(stat -c '%y' "$snap_dir" 2>/dev/null | cut -d'.' -f1)
+            snap_epoch=$(stat -c '%Y' "$snap_dir" 2>/dev/null || echo "")
+        fi
+
+        rel_time_str=""
+        if [[ -n "$snap_epoch" ]]; then
+            rel_time_str=" ($(format_relative_time "$snap_epoch"))"
+        fi
+
         desc_text="${snap_desc:+ - $snap_desc}"
-        ITEMS+=("$snap_id" "Snapshot #$snap_id$desc_text ($snap_date)")
+        status_badge=""
+        is_modified=false
+
+        if [[ -f "$snap_target" ]]; then
+            s_mtime=$(stat -c '%Y' "$snap_target" 2>/dev/null || echo "0")
+            s_size=$(stat -c '%s' "$snap_target" 2>/dev/null || echo "0")
+            s_sig="${s_mtime}:${s_size}"
+            s_human_size=$(format_size "$s_size")
+
+            if [[ -n "$LIVE_SIG" && "$s_sig" == "$LIVE_SIG" ]]; then
+                status_badge=" [$s_human_size • Igual ao atual]"
+            else
+                status_badge=" [$s_human_size • Modificado]"
+                is_modified=true
+                ((CHANGED_COUNT++))
+            fi
+        elif [[ -d "$snap_target" ]]; then
+            status_badge=" [Pasta]"
+        fi
+
+        label="Snapshot #$snap_id • $snap_date$rel_time_str$desc_text$status_badge"
+        ALL_ITEMS+=("$snap_id" "$label")
+        if $is_modified; then
+            CHANGED_ITEMS+=("$snap_id" "$label")
+        fi
     fi
 done
 
-if [ ${#ITEMS[@]} -eq 0 ]; then
-    kdialog --title "Snapshots" --sorry "Nenhum snapshot encontrado contendo este item."
+if [[ $TOTAL_SNAPS -eq 0 ]]; then
+    if $LIVE_IS_DIR; then
+        kdialog --title "Snapshots" --sorry "Nenhum snapshot encontrado contendo esta pasta."
+    else
+        kdialog --title "Snapshots" --sorry "Nenhum snapshot encontrado contendo este arquivo."
+    fi
     exit 0
 fi
 
-# Exibe o menu nativo de seleção
-CHOSEN_ID=$(kdialog --title "Versões de: $(basename "$TARGET")" \
-                    --menu "Selecione o snapshot que deseja abrir:" \
-                    "${ITEMS[@]}")
-
-# Abre o Dolphin no snapshot escolhido
-if [ -n "$CHOSEN_ID" ]; then
-    DEST="$BASE/.snapshots/$CHOSEN_ID/snapshot/$REL_PATH"
-    if [ -d "$DEST" ]; then
-        dolphin "$DEST" &
-    else
-        dolphin --select "$DEST" &
-    fi
+# Se for arquivo e houver tanto snapshots modificados quanto iguais, permite filtrar apenas modificados
+MENU_ITEMS=("${ALL_ITEMS[@]}")
+if [[ ! $LIVE_IS_DIR == true && $CHANGED_COUNT -gt 0 && $CHANGED_COUNT -lt $TOTAL_SNAPS ]]; then
+    MENU_ITEMS=(
+        "__FILTER_MODIFIED__" "🔍 [Filtrar: mostrar apenas as $CHANGED_COUNT versões com alterações]"
+        "${ALL_ITEMS[@]}"
+    )
 fi
+
+HEADER_TEXT="Item: $(basename "$LIVE_TARGET")  |  Subvolume: $BASE  |  Snapshots encontrados: $TOTAL_SNAPS"
+if [[ ! $LIVE_IS_DIR == true ]]; then
+    HEADER_TEXT="$HEADER_TEXT ($CHANGED_COUNT com diferenças)"
+fi
+
+CHOSEN_ID=$(kdialog --title "Histórico de Snapshots: $(basename "$LIVE_TARGET")" \
+                    --geometry 760x460 \
+                    --menu "$HEADER_TEXT\nSelecione um snapshot:" \
+                    "${MENU_ITEMS[@]}") || exit 0
+
+[[ -z "$CHOSEN_ID" ]] && exit 0
+
+# Se escolheu filtrar apenas versões modificadas
+if [[ "$CHOSEN_ID" == "__FILTER_MODIFIED__" ]]; then
+    CHOSEN_ID=$(kdialog --title "Versões Modificadas: $(basename "$LIVE_TARGET")" \
+                        --geometry 760x440 \
+                        --menu "Exibindo apenas snapshots onde o arquivo difere da versão atual ($CHANGED_COUNT):" \
+                        "${CHANGED_ITEMS[@]}") || exit 0
+    [[ -z "$CHOSEN_ID" ]] && exit 0
+fi
+
+# Se escolheu procurar arquivos excluídos na pasta
+if [[ "$CHOSEN_ID" == "__SEARCH_DELETED__" ]]; then
+    search_deleted_in_folder "$BASE" "$REL_PATH" "$LIVE_TARGET"
+    exit 0
+fi
+
+DEST="$BASE/.snapshots/$CHOSEN_ID/snapshot/$REL_PATH"
+
+# 5. Menu de Ações sobre o Snapshot Selecionado
+if [[ -d "$DEST" ]]; then
+    ACTION=$(kdialog --title "Snapshot #$CHOSEN_ID - $(basename "$LIVE_TARGET")" \
+                     --geometry 580x360 \
+                     --menu "Escolha a ação para a pasta no Snapshot #$CHOSEN_ID:" \
+                     "dolphin"       "📂 Abrir pasta do snapshot no Dolphin" \
+                     "dolphin_split" "🪟 Abrir no Dolphin lado a lado (Atual vs Snapshot)" \
+                     "deleted"       "🗑️ Procurar arquivos excluídos nesta pasta" \
+                     "diff"          "🔍 Comparar pastas (Kompare / KDiff3 / Meld)" \
+                     "restore"       "♻️ Restaurar pasta para esta versão (Copy-on-Write)" \
+                     "restore_copy"  "📄 Restaurar pasta como cópia ao lado") || exit 0
+else
+    ACTION=$(kdialog --title "Snapshot #$CHOSEN_ID - $(basename "$LIVE_TARGET")" \
+                     --geometry 580x360 \
+                     --menu "Escolha a ação para o arquivo no Snapshot #$CHOSEN_ID:" \
+                     "diff"          "🔍 Comparar com a versão atual (Diff Visual)" \
+                     "restore"       "♻️ Restaurar esta versão (com opção de backup .bak)" \
+                     "restore_copy"  "📄 Restaurar como cópia ao lado do original" \
+                     "dolphin"       "📂 Mostrar arquivo do snapshot no Dolphin" \
+                     "dolphin_split" "🪟 Abrir pastas lado a lado no Dolphin (Modo Dividido)") || exit 0
+fi
+
+[[ -z "$ACTION" ]] && exit 0
+
+case "$ACTION" in
+    dolphin)
+        if [[ -d "$DEST" ]]; then
+            dolphin "$DEST" &
+        else
+            dolphin --select "$DEST" &
+        fi
+        ;;
+    dolphin_split)
+        if [[ -d "$DEST" ]]; then
+            dolphin --split "$LIVE_TARGET" "$DEST" &
+        else
+            dolphin --split "$(dirname "$LIVE_TARGET")" "$(dirname "$DEST")" &
+        fi
+        ;;
+    deleted)
+        search_deleted_in_folder "$BASE" "$REL_PATH" "$LIVE_TARGET"
+        ;;
+    diff)
+        run_diff_tool "$DEST" "$LIVE_TARGET" "$BASE" "$CHOSEN_ID"
+        ;;
+    restore)
+        restore_snapshot_item "$DEST" "$LIVE_TARGET" "$CHOSEN_ID" "overwrite"
+        ;;
+    restore_copy)
+        restore_snapshot_item "$DEST" "$LIVE_TARGET" "$CHOSEN_ID" "copy"
+        ;;
+esac

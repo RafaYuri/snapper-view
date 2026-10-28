@@ -67,17 +67,60 @@ fi
 info "Instalando 'snapper-history.desktop' em '$MENU_DIR'..."
 if [[ -f "$SCRIPT_DIR/snapper-history.desktop" ]]; then
     cp -f "$SCRIPT_DIR/snapper-history.desktop" "$MENU_DIR/snapper-history.desktop"
-    success "Arquivo '$MENU_DIR/snapper-history.desktop' instalado."
+    chmod +x "$MENU_DIR/snapper-history.desktop"
+    success "Arquivo '$MENU_DIR/snapper-history.desktop' instalado com permissão de execução."
 else
     error "Arquivo fonte '$SCRIPT_DIR/snapper-history.desktop' não encontrado."
     exit 1
 fi
 
 echo ""
-success "Arquivos instalados com sucesso!"
+success "Arquivos principais instalados com sucesso!"
 echo ""
 
-# 5. Oferece configurar permissões do Snapper
+# 5. Verifica ferramenta visual de Diff (Kompare / KDiff3 / Meld)
+FOUND_DIFF=""
+for native_cmd in kompare kdiff3 meld; do
+    if command -v "$native_cmd" &>/dev/null; then
+        FOUND_DIFF="$native_cmd (pacote nativo)"
+        break
+    fi
+done
+
+if [[ -z "$FOUND_DIFF" ]] && command -v flatpak &>/dev/null; then
+    for fp_app in org.kde.kompare org.kde.kdiff3 org.gnome.meld; do
+        if flatpak info "$fp_app" &>/dev/null; then
+            FOUND_DIFF="$fp_app (Flatpak)"
+            break
+        fi
+    done
+fi
+
+if [[ -n "$FOUND_DIFF" ]]; then
+    success "Ferramenta visual de comparação detectada: $FOUND_DIFF"
+    echo ""
+elif command -v flatpak &>/dev/null; then
+    echo -e "${BOLD}Ferramenta Visual de Comparação (Diff):${NC}"
+    echo "Nenhuma ferramenta gráfica de comparação (Kompare, KDiff3 ou Meld) foi detectada."
+    echo "O Kompare (org.kde.kompare) é a ferramenta oficial do KDE recomendada para"
+    echo "comparar visualmente versões de arquivos e pastas nos snapshots."
+    echo ""
+    read -r -p "Deseja instalar o Kompare via Flathub agora? [S/n] " diff_answer
+    diff_answer="${diff_answer:-s}"
+    if [[ "$diff_answer" =~ ^[sSyY]$ ]]; then
+        info "Instalando org.kde.kompare via Flathub..."
+        if flatpak install -y --or-update flathub org.kde.kompare || flatpak install --user -y --or-update flathub org.kde.kompare; then
+            success "Kompare (org.kde.kompare) instalado com sucesso via Flathub!"
+        else
+            warn "Não foi possível instalar o Kompare agora. O snapper-view poderá instalá-lo sob demanda quando necessário."
+        fi
+    else
+        info "Caso precise comparar arquivos depois, o snapper-view oferecerá a instalação automática via Flathub ou usará o diff em texto nativo."
+    fi
+    echo ""
+fi
+
+# 6. Oferece configurar permissões do Snapper
 if [[ -f "$SCRIPT_DIR/setup-permissions.sh" ]]; then
     echo -e "${BOLD}Permissões do Snapper:${NC}"
     echo "Para que o usuário comum possa ler os snapshots na pasta .snapshots,"
